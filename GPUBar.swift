@@ -57,13 +57,17 @@ func fetch(_ host: String) async -> Node {
     var interval = UserDefaults.standard.object(forKey: "interval") as? Double ?? 10
     var openAtLogin = SMAppService.mainApp.status == .enabled
     var gpus: [GPU] { nodes.flatMap(\.gpus) }
+    @ObservationIgnored private var loop: Task<Void, Never>?
 
-    init() {
-        Task {
-            while true {
+    init() { restart() }
+
+    // Poll now, then every `interval`. Called again on a manual refresh or a new interval.
+    func restart() {
+        loop?.cancel()
+        loop = Task {
+            while !Task.isCancelled {
                 await refresh()
-                // tick every second so a new interval or a manual refresh takes effect at once
-                while let t = updated, Date.now.timeIntervalSince(t) < interval { try? await Task.sleep(for: .seconds(1)) }
+                try? await Task.sleep(for: .seconds(interval))
             }
         }
     }
@@ -81,6 +85,7 @@ func fetch(_ host: String) async -> Node {
     func setInterval(_ seconds: Double) {
         interval = seconds
         UserDefaults.standard.set(seconds, forKey: "interval")
+        restart()
     }
 
     func setOpenAtLogin(_ on: Bool) {
@@ -133,7 +138,7 @@ struct Panel: View {
             HStack {
                 if let t = monitor.updated { Text("Updated \(t, style: .time)") }
                 Spacer()
-                Button { Task { await monitor.refresh() } } label: { Image(systemName: "arrow.clockwise") }
+                Button { monitor.restart() } label: { Image(systemName: "arrow.clockwise") }
                     .help("Refresh now")
                 let interval = monitor.interval, on = monitor.openAtLogin  // read here so the panel re-renders when they change
                 Menu {

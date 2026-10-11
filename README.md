@@ -7,6 +7,8 @@
 The menu bar shows free GPUs and mean utilization across all hosts, e.g. `6/12 · 23%`.
 Click it for utilization, memory and temperature per GPU.
 
+<p align="center"><img src="screenshot.png" width="396" alt="GPUBar popover with sample data"></p>
+
 ## Requirements
 
 - macOS 14 or later

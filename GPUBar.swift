@@ -4,7 +4,12 @@ import ServiceManagement
 import SwiftUI
 
 let hostsFile = URL.homeDirectory.appending(path: ".config/gpubar/hosts")
-let query = "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits"
+// GPU rows, then "uuid, MiB" per compute process the ssh user owns (/proc/<pid> ownership). sh -c: any login shell.
+let query = """
+sh -c 'nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,uuid --format=csv,noheader,nounits && \
+nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits | \
+while IFS=", " read -r g p m; do if [ -O /proc/$p ]; then echo "$g, $m"; fi; done'
+"""
 
 // Re-read on every refresh, so edits apply without a restart. Lines starting with # are skipped.
 func hosts() -> [String] {
@@ -15,6 +20,7 @@ func hosts() -> [String] {
 
 struct GPU: Identifiable {
     let id: Int, name: String, util: Int, memUsed: Int, memTotal: Int, temp: Int
+    var mine = 0  // MiB held by your processes
     // free = idle and holding under 5% of its memory
     var free: Bool { util < 10 && memUsed * 20 < memTotal }
 }
@@ -38,11 +44,12 @@ func fetch(_ host: String) async -> Node {
                 let msg = p.terminationReason == .uncaughtSignal ? "timed out" : text(err).split(separator: "\n").last.map(String.init)
                 return done.resume(returning: Node(id: host, error: msg ?? "exit \(p.terminationStatus)"))
             }
-            let gpus = text(out).split(separator: "\n").compactMap { line -> GPU? in
-                let f = line.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-                guard f.count == 6 else { return nil }
+            let rows = text(out).split(separator: "\n").map { $0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) } }
+            var mine = [String: Int]()
+            for f in rows where f.count == 2 { mine[f[0], default: 0] += Int(f[1]) ?? 0 }
+            let gpus = rows.filter { $0.count == 7 }.map { f in
                 let n = f.map { Int($0) ?? 0 }  // "[N/A]" fields read as 0
-                return GPU(id: n[0], name: f[1].replacingOccurrences(of: "NVIDIA ", with: ""), util: n[2], memUsed: n[3], memTotal: n[4], temp: n[5])
+                return GPU(id: n[0], name: f[1].replacingOccurrences(of: "NVIDIA ", with: ""), util: n[2], memUsed: n[3], memTotal: n[4], temp: n[5], mine: mine[f[6]] ?? 0)
             }
             done.resume(returning: Node(id: host, gpus: gpus))
         }
@@ -173,12 +180,13 @@ struct Row: View {
             Text("\(gpu.id)").foregroundStyle(.secondary)
             Bar(fraction: Double(gpu.util) / 100, color: .accentColor)
             Text("\(gpu.util)%").frame(width: 32, alignment: .trailing)
-            Bar(fraction: Double(gpu.memUsed) / Double(max(gpu.memTotal, 1)), color: .secondary)
+            Bar(fraction: Double(gpu.memUsed) / Double(max(gpu.memTotal, 1)), color: .secondary, mine: Double(gpu.mine) / Double(max(gpu.memTotal, 1)))
+            Text(gpu.mine > 0 ? "\(gb(gpu.mine))G" : "").foregroundStyle(.purple).frame(width: 26, alignment: .trailing)
             Text("\(gb(gpu.memUsed))/\(gb(gpu.memTotal))G").frame(width: 50, alignment: .trailing)
             Text("\(gpu.temp)°").foregroundStyle(.secondary).frame(width: 26, alignment: .trailing)
         }
         .font(.system(size: 11).monospacedDigit())
-        .help("\(gpu.name) · util \(gpu.util)% · \(gpu.memUsed) MiB used")
+        .help("\(gpu.name) · util \(gpu.util)% · \(gpu.memUsed) MiB used, yours \(gpu.mine) MiB")
     }
 
     func gb(_ mib: Int) -> Int { Int((Double(mib) / 1024).rounded()) }
@@ -186,10 +194,16 @@ struct Row: View {
 
 struct Bar: View {
     let fraction: Double, color: Color
+    var mine = 0.0  // your share, drawn over the fill in purple
 
     var body: some View {
         Capsule().fill(.quaternary)
-            .overlay(alignment: .leading) { GeometryReader { Capsule().fill(color).frame(width: $0.size.width * fraction) } }
+            .overlay(alignment: .leading) {
+                GeometryReader { g in
+                    Capsule().fill(color).frame(width: g.size.width * fraction)
+                    Capsule().fill(.purple).frame(width: g.size.width * mine)
+                }
+            }
             .frame(height: 5)
     }
 }

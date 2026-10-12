@@ -55,7 +55,9 @@ func fetch(_ host: String) async -> Node {
             }
             let gpus = rows.filter { $0.count == 7 }.map { f in
                 let n = f.map { Int($0) ?? 0 }  // "[N/A]" fields read as 0
-                return GPU(id: n[0], name: f[1].replacingOccurrences(of: "NVIDIA ", with: ""), util: n[2], memUsed: n[3], memTotal: n[4], temp: n[5], mine: mine[f[6]] ?? 0, users: users[f[6], default: []].sorted())
+                let u = users[f[6], default: []]
+                return GPU(id: n[0], name: f[1].replacingOccurrences(of: "NVIDIA ", with: ""), util: n[2], memUsed: n[3], memTotal: n[4], temp: n[5], mine: mine[f[6]] ?? 0,
+                           users: (u.contains(me) ? ["you"] : []) + u.subtracting([me]).sorted())
             }
             done.resume(returning: Node(id: host, gpus: gpus))
         }

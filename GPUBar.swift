@@ -22,7 +22,8 @@ func hosts() -> [String] {
 struct GPU: Identifiable {
     let id: Int, name: String, util: Int, memUsed: Int, memTotal: Int, temp: Int
     var mine = 0  // MiB held by your processes
-    var users: [String] = []
+    var you = false  // one of your processes runs on it
+    var users: [String] = []  // everyone else, by name
     // free = idle and holding under 5% of its memory
     var free: Bool { util < 10 && memUsed * 20 < memTotal }
 }
@@ -57,7 +58,7 @@ func fetch(_ host: String) async -> Node {
                 let n = f.map { Int($0) ?? 0 }  // "[N/A]" fields read as 0
                 let u = users[f[6], default: []]
                 return GPU(id: n[0], name: f[1].replacingOccurrences(of: "NVIDIA ", with: ""), util: n[2], memUsed: n[3], memTotal: n[4], temp: n[5], mine: mine[f[6]] ?? 0,
-                           users: (u.contains(me) ? ["you"] : []) + u.subtracting([me]).sorted())
+                           you: u.contains(me), users: u.subtracting([me]).sorted())
             }
             done.resume(returning: Node(id: host, gpus: gpus))
         }
@@ -192,7 +193,10 @@ struct Row: View {
             Text(gpu.mine > 0 ? "\(gb(gpu.mine))G" : "").foregroundStyle(.purple).frame(width: 26, alignment: .trailing)
             Text("\(gb(gpu.memUsed))/\(gb(gpu.memTotal))G").frame(width: 50, alignment: .trailing)
             Text("\(gpu.temp)°").foregroundStyle(.secondary).frame(width: 26, alignment: .trailing)
-            Text(gpu.users.joined(separator: ", ")).foregroundStyle(.secondary).lineLimit(1).frame(width: 62, alignment: .leading)
+            // "you" in purple, so a user literally named "you" stays distinguishable
+            let others = gpu.users.joined(separator: ", ")
+            (gpu.you ? Text("\(Text("you").foregroundStyle(.purple))\(others.isEmpty ? "" : ", " + others)") : Text(others))
+                .foregroundStyle(.secondary).lineLimit(1).frame(width: 62, alignment: .leading)
         }
         .font(.system(size: 11).monospacedDigit())
         .help("\(gpu.name) · util \(gpu.util)% · \(gpu.memUsed) MiB used, yours \(gpu.mine) MiB · \(gpu.users.joined(separator: ", "))")

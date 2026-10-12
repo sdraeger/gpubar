@@ -4,11 +4,12 @@ import ServiceManagement
 import SwiftUI
 
 let hostsFile = URL.homeDirectory.appending(path: ".config/gpubar/hosts")
-// GPU rows, then "uuid, MiB" per compute process the ssh user owns (/proc/<pid> ownership). sh -c: any login shell.
+// The ssh user's name, GPU rows, then "uuid, MiB, owner" per compute process. sh -c: any login shell.
 let query = """
-sh -c 'nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,uuid --format=csv,noheader,nounits && \
+sh -c 'id -un && \
+nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,uuid --format=csv,noheader,nounits && \
 nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits | \
-while IFS=", " read -r g p m; do if [ -O /proc/$p ]; then echo "$g, $m"; fi; done'
+while IFS=", " read -r g p m; do echo "$g, $m, $(stat -c %U /proc/$p 2>/dev/null)"; done'
 """
 
 // Re-read on every refresh, so edits apply without a restart. Lines starting with # are skipped.
@@ -21,6 +22,7 @@ func hosts() -> [String] {
 struct GPU: Identifiable {
     let id: Int, name: String, util: Int, memUsed: Int, memTotal: Int, temp: Int
     var mine = 0  // MiB held by your processes
+    var users: [String] = []
     // free = idle and holding under 5% of its memory
     var free: Bool { util < 10 && memUsed * 20 < memTotal }
 }
@@ -45,11 +47,15 @@ func fetch(_ host: String) async -> Node {
                 return done.resume(returning: Node(id: host, error: msg ?? "exit \(p.terminationStatus)"))
             }
             let rows = text(out).split(separator: "\n").map { $0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) } }
-            var mine = [String: Int]()
-            for f in rows where f.count == 2 { mine[f[0], default: 0] += Int(f[1]) ?? 0 }
+            let me = rows.first?.first ?? ""
+            var mine = [String: Int](), users = [String: Set<String>]()
+            for f in rows where f.count == 3 && !f[2].isEmpty {  // empty owner: process exited meanwhile
+                users[f[0], default: []].insert(f[2])
+                if f[2] == me { mine[f[0], default: 0] += Int(f[1]) ?? 0 }
+            }
             let gpus = rows.filter { $0.count == 7 }.map { f in
                 let n = f.map { Int($0) ?? 0 }  // "[N/A]" fields read as 0
-                return GPU(id: n[0], name: f[1].replacingOccurrences(of: "NVIDIA ", with: ""), util: n[2], memUsed: n[3], memTotal: n[4], temp: n[5], mine: mine[f[6]] ?? 0)
+                return GPU(id: n[0], name: f[1].replacingOccurrences(of: "NVIDIA ", with: ""), util: n[2], memUsed: n[3], memTotal: n[4], temp: n[5], mine: mine[f[6]] ?? 0, users: users[f[6], default: []].sorted())
             }
             done.resume(returning: Node(id: host, gpus: gpus))
         }
@@ -167,7 +173,7 @@ struct Panel: View {
             .foregroundStyle(.secondary)
         }
         .padding(14)
-        .frame(width: 340)
+        .frame(width: 410)
     }
 }
 
@@ -184,9 +190,10 @@ struct Row: View {
             Text(gpu.mine > 0 ? "\(gb(gpu.mine))G" : "").foregroundStyle(.purple).frame(width: 26, alignment: .trailing)
             Text("\(gb(gpu.memUsed))/\(gb(gpu.memTotal))G").frame(width: 50, alignment: .trailing)
             Text("\(gpu.temp)°").foregroundStyle(.secondary).frame(width: 26, alignment: .trailing)
+            Text(gpu.users.joined(separator: ", ")).foregroundStyle(.secondary).lineLimit(1).frame(width: 62, alignment: .leading)
         }
         .font(.system(size: 11).monospacedDigit())
-        .help("\(gpu.name) · util \(gpu.util)% · \(gpu.memUsed) MiB used, yours \(gpu.mine) MiB")
+        .help("\(gpu.name) · util \(gpu.util)% · \(gpu.memUsed) MiB used, yours \(gpu.mine) MiB · \(gpu.users.joined(separator: ", "))")
     }
 
     func gb(_ mib: Int) -> Int { Int((Double(mib) / 1024).rounded()) }

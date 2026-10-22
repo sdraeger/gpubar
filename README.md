@@ -7,6 +7,7 @@
 The menu bar shows free GPUs and mean utilization across all hosts, e.g. `6/12 · 23%`.
 Click it for utilization, memory and temperature per GPU.
 Busy GPUs list who is using them; memory held by your own processes shows in purple.
+Click a GPU to list its processes, and pin the popover to keep it open while you work elsewhere.
 
 <p align="center"><img src="screenshot.png" width="466" alt="GPUBar popover with sample data"></p>
 

@@ -4,12 +4,13 @@ import ServiceManagement
 import SwiftUI
 
 let hostsFile = URL.homeDirectory.appending(path: ".config/gpubar/hosts")
-// The ssh user's name, GPU rows, then "uuid, MiB, owner" per compute process. sh -c: any login shell.
+// The ssh user's name, GPU rows, then "uuid, pid, MiB, owner, command" per compute process. sh -c: any login shell.
 let query = """
 sh -c 'id -un && \
 nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,uuid --format=csv,noheader,nounits && \
 nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits | \
-while IFS=", " read -r g p m; do echo "$g, $m, $(stat -c %U /proc/$p 2>/dev/null)"; done'
+while IFS=", " read -r g p m; do \
+echo "$g, $p, $m, $(stat -c %U /proc/$p 2>/dev/null), $(tr "\\0" " " 2>/dev/null </proc/$p/cmdline)"; done'
 """
 
 // Re-read on every refresh, so edits apply without a restart. Lines starting with # are skipped.
@@ -21,11 +22,16 @@ func hosts() -> [String] {
 
 struct GPU: Identifiable {
     let id: Int, name: String, util: Int, memUsed: Int, memTotal: Int, temp: Int
-    var mine = 0  // MiB held by your processes
-    var you = false  // one of your processes runs on it
-    var users: [String] = []  // everyone else, by name
+    var procs: [Proc] = []
+    var mine: Int { procs.filter(\.mine).map(\.mib).reduce(0, +) }  // MiB held by your processes
+    var you: Bool { procs.contains(where: \.mine) }
+    var users: [String] { Set(procs.filter { !$0.mine }.map(\.user)).sorted() }  // everyone else
     // free = idle and holding under 5% of its memory
     var free: Bool { util < 10 && memUsed * 20 < memTotal }
+}
+
+struct Proc {
+    let pid: String, mib: Int, user: String, mine: Bool, command: String
 }
 
 struct Node: Identifiable {
@@ -47,19 +53,20 @@ func fetch(_ host: String) async -> Node {
                 let msg = p.terminationReason == .uncaughtSignal ? "timed out" : text(err).split(separator: "\n").last.map(String.init)
                 return done.resume(returning: Node(id: host, error: msg ?? "exit \(p.terminationStatus)"))
             }
-            let rows = text(out).split(separator: "\n").map { $0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) } }
-            let me = rows.first?.first ?? ""
-            var mine = [String: Int](), users = [String: Set<String>]()
-            for f in rows where f.count == 3 && !f[2].isEmpty {  // empty owner: process exited meanwhile
-                users[f[0], default: []].insert(f[2])
-                if f[2] == me { mine[f[0], default: 0] += Int(f[1]) ?? 0 }
+            let lines = text(out).split(separator: "\n")
+            let me = lines.first.map(String.init) ?? ""
+            var procs = [String: [Proc]]()
+            for l in lines where l.hasPrefix("GPU-") {  // the command is last and may itself contain commas
+                let f = l.split(separator: ",", maxSplits: 4, omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
+                guard f.count == 5, !f[3].isEmpty else { continue }  // empty owner: process exited meanwhile
+                procs[f[0], default: []].append(Proc(pid: f[1], mib: Int(f[2]) ?? 0, user: f[3], mine: f[3] == me, command: f[4]))
             }
-            let gpus = rows.filter { $0.count == 7 }.map { f in
-                let n = f.map { Int($0) ?? 0 }  // "[N/A]" fields read as 0
-                let u = users[f[6], default: []]
-                return GPU(id: n[0], name: f[1].replacingOccurrences(of: "NVIDIA ", with: ""), util: n[2], memUsed: n[3], memTotal: n[4], temp: n[5], mine: mine[f[6]] ?? 0,
-                           you: u.contains(me), users: u.subtracting([me]).sorted())
-            }
+            let gpus = lines.filter { !$0.hasPrefix("GPU-") }.map { $0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) } }
+                .filter { $0.count == 7 }.map { f in
+                    let n = f.map { Int($0) ?? 0 }  // "[N/A]" fields read as 0
+                    return GPU(id: n[0], name: f[1].replacingOccurrences(of: "NVIDIA ", with: ""), util: n[2], memUsed: n[3], memTotal: n[4], temp: n[5],
+                               procs: procs[f[6], default: []].sorted { $0.mib > $1.mib })
+                }
             done.resume(returning: Node(id: host, gpus: gpus))
         }
         do { try p.run() } catch { return done.resume(returning: Node(id: host, error: error.localizedDescription)) }
@@ -73,6 +80,8 @@ func fetch(_ host: String) async -> Node {
     var interval = UserDefaults.standard.object(forKey: "interval") as? Double ?? 10
     var openAtLogin = SMAppService.mainApp.status == .enabled
     var gpus: [GPU] { nodes.flatMap(\.gpus) }
+    var expanded: Set<String> = []  // "host/index" of GPUs showing their processes
+    var pinned = false  // popover stays open when it loses focus
     @ObservationIgnored private var loop: Task<Void, Never>?
 
     init() { restart() }
@@ -110,18 +119,44 @@ func fetch(_ host: String) async -> Node {
     }
 }
 
-@main struct GPUBar: App {
-    private let monitor = Monitor()  // App is created once; @State needs Xcode's macro plugin
+// AppKit status item + NSPopover: unlike MenuBarExtra, a popover can stay open when it loses focus (pin).
+@main @MainActor final class GPUBar: NSObject {
+    static func main() {
+        let app = NSApplication.shared
+        withExtendedLifetime(GPUBar()) { app.run() }
+    }
 
-    var body: some Scene {
-        MenuBarExtra {
-            Panel(monitor: monitor)
-        } label: {
+    let monitor = Monitor()
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let popover = NSPopover()
+
+    override init() {
+        super.init()
+        let host = NSHostingController(rootView: Panel(monitor: monitor))
+        host.sizingOptions = .preferredContentSize  // popover follows the panel's height as rows expand
+        popover.contentViewController = host
+        item.button?.image = NSImage(systemSymbolName: "memorychip", accessibilityDescription: "GPUs")
+        item.button?.imagePosition = .imageLeading
+        item.button?.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        item.button?.target = self
+        item.button?.action = #selector(toggle)
+        sync()
+    }
+
+    @objc func toggle() {
+        guard let b = item.button else { return }
+        if popover.isShown { popover.performClose(nil) } else { NSApp.activate(); popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY) }
+    }
+
+    // Re-run whenever the menu bar numbers or the pin change.
+    func sync() {
+        withObservationTracking {
             let g = monitor.gpus
-            Image(systemName: "memorychip")
-            Text(g.isEmpty ? "–" : "\(g.filter(\.free).count)/\(g.count) · \(g.map(\.util).reduce(0, +) / g.count)%")
+            item.button?.title = g.isEmpty ? " –" : " \(g.filter(\.free).count)/\(g.count) · \(g.map(\.util).reduce(0, +) / g.count)%"
+            popover.behavior = monitor.pinned ? .applicationDefined : .transient
+        } onChange: {
+            Task { @MainActor in self.sync() }
         }
-        .menuBarExtraStyle(.window)
     }
 }
 
@@ -147,7 +182,22 @@ struct Panel: View {
                         }
                     }
                     .font(.caption)
-                    ForEach(node.gpus) { Row(gpu: $0) }
+                    ForEach(node.gpus) { g in
+                        let key = "\(node.id)/\(g.id)"
+                        Row(gpu: g).onTapGesture { monitor.expanded.formSymmetricDifference([key]) }
+                        if monitor.expanded.contains(key) {
+                            ForEach(g.procs, id: \.pid) { p in
+                                HStack(spacing: 8) {
+                                    Text(p.pid).frame(width: 50, alignment: .trailing)
+                                    (p.mine ? Text("you").foregroundStyle(.purple) : Text(p.user)).frame(width: 62, alignment: .leading)
+                                    Text(String(format: "%.1fG", Double(p.mib) / 1024)).frame(width: 38, alignment: .trailing)
+                                    Text(p.command).lineLimit(1).truncationMode(.middle).help(p.command)
+                                }
+                                .font(.system(size: 10).monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
                 }
             }
             Divider()
@@ -156,6 +206,8 @@ struct Panel: View {
                 Spacer()
                 Button { monitor.restart() } label: { Image(systemName: "arrow.clockwise") }
                     .help("Refresh now")
+                Button { monitor.pinned.toggle() } label: { Image(systemName: monitor.pinned ? "pin.fill" : "pin") }
+                    .help(monitor.pinned ? "Unpin" : "Keep open when clicking elsewhere")
                 let interval = monitor.interval, on = monitor.openAtLogin  // read here so the panel re-renders when they change
                 Menu {
                     Picker("Refresh every", selection: Binding(get: { interval }, set: { monitor.setInterval($0) })) {
@@ -199,7 +251,8 @@ struct Row: View {
                 .foregroundStyle(.secondary).lineLimit(1).frame(width: 62, alignment: .leading)
         }
         .font(.system(size: 11).monospacedDigit())
-        .help("\(gpu.name) · util \(gpu.util)% · \(gpu.memUsed) MiB used, yours \(gpu.mine) MiB · \(gpu.users.joined(separator: ", "))")
+        .contentShape(.rect)
+        .help("\(gpu.name) · \(gpu.procs.count) processes, click to show")
     }
 
     func gb(_ mib: Int) -> Int { Int((Double(mib) / 1024).rounded()) }
